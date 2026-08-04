@@ -68,6 +68,28 @@ async function main() {
   if (Math.abs(latestSession.expectedPosition) > 0.2 || !latestSession.isPlaying) throw new Error("FAIL: restart should reset to 0 and play");
   console.log("[ok] restart resets to 0 and resumes playing");
 
+  for (let i = 0; i < 5; i++) {
+    display.emit("display:status", {
+      position: latestSession.expectedPosition + 5,
+      isPlaying: true,
+      isLoading: false,
+    });
+    await wait(3100); // clear the correction cooldown each time
+  }
+
+  let healthReport = null;
+  controller.on("controller:healthReportResult", (r) => (healthReport = r));
+  controller.emit("controller:healthReport");
+  await wait(300);
+
+  console.log("[check] health report:", JSON.stringify(healthReport, null, 2));
+  if (!healthReport) throw new Error("FAIL: no health report received");
+  const displayA = healthReport.displays.find((d) => d.clientId === "display-A");
+  if (!displayA) throw new Error("FAIL: display-A missing from health report");
+  if (displayA.status !== "Needs attention") throw new Error("FAIL: expected 'Needs attention', got " + displayA.status);
+  if (!displayA.recommendation) throw new Error("FAIL: expected a recommendation for a flagged display");
+  console.log("[ok] health report correctly flags a display with repeated corrections");
+
   // Disconnect display, confirm controller sees it drop
   display.disconnect();
   await wait(300);

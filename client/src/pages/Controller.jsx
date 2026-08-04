@@ -10,6 +10,8 @@ export default function Controller() {
   const [videos, setVideos] = useState([]);
   const [seekValue, setSeekValue] = useState(0);
   const [now, setNow] = useState(Date.now());
+  const [healthReport, setHealthReport] = useState(null);
+  const [healthLoading, setHealthLoading] = useState(false);
 
   useEffect(() => {
     socket.connect();
@@ -21,12 +23,17 @@ export default function Controller() {
     function onDisconnect() {
       setConnected(false);
     }
+    function onHealthReportResult(report) {
+      setHealthReport(report);
+      setHealthLoading(false);
+    }
 
     socket.on("connect", onConnect);
     socket.on("disconnect", onDisconnect);
     socket.on("videos:list", setVideos);
     socket.on("session:state", setSession);
     socket.on("displays:update", setDisplays);
+    socket.on("controller:healthReportResult", onHealthReportResult);
 
     return () => {
       socket.off("connect", onConnect);
@@ -34,6 +41,7 @@ export default function Controller() {
       socket.off("videos:list", setVideos);
       socket.off("session:state", setSession);
       socket.off("displays:update", setDisplays);
+      socket.off("controller:healthReportResult", onHealthReportResult);
       socket.disconnect();
     };
   }, []);
@@ -57,6 +65,10 @@ export default function Controller() {
   const pause = () => socket.emit("controller:pause");
   const restart = () => socket.emit("controller:restart");
   const seekTo = (position) => socket.emit("controller:seek", { position });
+  const runHealthReport = () => {
+    setHealthLoading(true);
+    socket.emit("controller:healthReport");
+  };
 
   return (
     <div style={styles.page}>
@@ -133,7 +145,7 @@ export default function Controller() {
               return (
                 <tr key={d.clientId}>
                   <td style={styles.td}>{d.clientId}</td>
-                  <td style={styles.td}>🟢 connected</td>
+                  <td style={styles.td}>connected</td>
                   <td style={styles.td}>{d.isLoading ? "loading" : d.isPlaying ? "playing" : "paused"}</td>
                   <td style={styles.td}>{d.position?.toFixed(2)}</td>
                   <td style={{ ...styles.td, color: driftColor, fontWeight: "bold" }}>{d.drift}</td>
@@ -143,6 +155,62 @@ export default function Controller() {
             })}
           </tbody>
         </table>
+      </section>
+
+      <section style={styles.section}>
+        <h3>
+          Health Report{" "}
+          <span style={styles.dim}>— rule-based analysis, not an LLM call</span>
+        </h3>
+        <button style={styles.button} onClick={runHealthReport} disabled={healthLoading}>
+          {healthLoading ? "Analyzing..." : "Generate Analysis"}
+        </button>
+
+        {healthReport && (
+          <div style={styles.reportBox}>
+            <p style={{ marginTop: 0 }}>
+              <strong>{healthReport.summary}</strong>
+            </p>
+            {healthReport.displays.length === 0 && (
+              <p style={styles.dim}>No display history yet.</p>
+            )}
+            {healthReport.displays.map((d) => (
+              <div key={d.clientId} style={styles.reportRow}>
+                <div style={{ display: "flex", justifyContent: "space-between" }}>
+                  <strong>{d.clientId}</strong>
+                  <span
+                    style={{
+                      color:
+                        d.status === "Needs attention"
+                          ? "#d33"
+                          : d.status === "Watch"
+                          ? "#c90"
+                          : "#2a2",
+                      fontWeight: "bold",
+                    }}
+                  >
+                    {d.status}
+                  </span>
+                </div>
+                <p style={styles.dim}>
+                  avg drift {d.avgDriftMs}ms · {d.correctionCount} corrections · {d.disconnectCount} disconnects
+                </p>
+                {d.reasons.length > 0 && (
+                  <ul style={{ margin: "4px 0", paddingLeft: 18, fontSize: 13 }}>
+                    {d.reasons.map((r, i) => (
+                      <li key={i}>{r}</li>
+                    ))}
+                  </ul>
+                )}
+                {d.recommendation && (
+                  <p style={{ fontSize: 13 }}>
+                    <strong>Recommended action:</strong> {d.recommendation}
+                  </p>
+                )}
+              </div>
+            ))}
+          </div>
+        )}
       </section>
     </div>
   );
@@ -159,4 +227,6 @@ const styles = {
   table: { width: "100%", borderCollapse: "collapse", marginTop: 8 },
   th: { textAlign: "left", borderBottom: "2px solid #333", padding: "6px 8px", fontSize: 13 },
   td: { borderBottom: "1px solid #eee", padding: "6px 8px", fontSize: 13 },
+  reportBox: { marginTop: 12, padding: 12, background: "#fafafa", border: "1px solid #eee", borderRadius: 6 },
+  reportRow: { padding: "8px 0", borderTop: "1px solid #eee" },
 };
