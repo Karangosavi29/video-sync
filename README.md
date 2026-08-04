@@ -1,40 +1,34 @@
-## Bonus: Rule-Based Health Report
+# Real-Time Multi-Display Video Synchronization System
 
-Beyond the core requirements, the Controller includes a **Generate Analysis** button that produces a per-display health summary (status, average drift, correction count, disconnect count, and a plain-English recommendation).
+A Controller application that drives synchronized video playback across multiple Display clients using Socket.IO.
 
-Although presented as an analysis feature, the implementation is intentionally a **deterministic rule engine**, not an LLM. The generated payload and UI are explicitly labeled with `"engine": "rule-based"`.
-
-This approach was chosen because operational recommendations should be reproducible and directly traceable to observable metrics. Every recommendation is derived from the same telemetry already visible in the Controller (drift, correction count, and disconnect count) using a small, deterministic set of thresholds, making the output fully inspectable and verifiable.
-
-An additional benefit is that the feature works entirely offline, requiring no API keys or external network dependencies. The structured output produced by `generateHealthReport()` is also designed so that a future LLM-based summarizer could consume the same data without requiring changes to the server API or telemetry pipeline.
+The server acts as the **authoritative source of playback state**, calculates expected playback position, detects client drift, and automatically corrects displays when they fall out of sync.
 
 ---
 
-# Real-Time Multi-Display Video Synchronization System
+# Architecture
 
-A Controller application drives playback across multiple Display clients, with synchronization coordinated through a Socket.IO server that maintains the authoritative playback state and automatically corrects client drift.
-
-## Architecture
-
-```text
+```
 video-sync/
-├── server/   Node.js + Express + Socket.IO (authoritative playback state)
+├── server/   Node.js + Express + Socket.IO (authoritative state)
 └── client/   React + Vite
     ├── /controller
     └── /display/:id
 ```
 
-### Why this architecture?
+## Why this architecture?
 
-The Controller and each Display act as independent real-time clients communicating with a single authoritative server. Since there are no server-rendered pages or backend routing requirements beyond real-time communication, separating the transport layer (Socket.IO) from the React client keeps the architecture simple and focused.
+The Controller and Displays are independent real-time clients connected through a single server that owns the playback state.
 
-While a single Next.js application could also satisfy the requirements, it would introduce additional framework complexity without providing meaningful benefits for this use case.
+A separate Node.js + Socket.IO server keeps the synchronization logic centralized and avoids relying on clients to coordinate with each other.
+
+A single Next.js application could also work, but it would introduce additional framework complexity without providing meaningful benefits for this real-time communication use case.
 
 ---
 
-# Authoritative Playback State
+# How Playback Synchronization Works
 
-The server never runs a continuously updating timer.
+The server does not run a continuously updating playback timer.
 
 Instead, it stores:
 
@@ -48,166 +42,303 @@ Instead, it stores:
 }
 ```
 
-The current playback position is derived whenever needed.
+The current playback position is calculated dynamically:
 
 ```
-if (isPlaying)
-    expected = positionAtLastUpdate +
-               (Date.now() - serverTimestampAtLastUpdate) / 1000
-else
-    expected = positionAtLastUpdate
+if playing:
+    expectedPosition =
+      positionAtLastUpdate +
+      (currentTime - serverTimestampAtLastUpdate)
+
+if paused:
+    expectedPosition =
+      positionAtLastUpdate
 ```
 
-Whenever the Controller issues a command (play, pause, seek, restart, or video change), the server first materializes the current derived playback position into `positionAtLastUpdate`, records a fresh timestamp, applies the requested change, and increments the sequence number.
+Whenever a Controller action occurs:
 
-Because the playback position is always computed from `(positionAtLastUpdate, serverTimestampAtLastUpdate, isPlaying)`, the server itself never accumulates timing drift.
+- Play
+- Pause
+- Seek
+- Restart
+- Video change
 
-Displays only apply authoritative playback updates when the broadcast `seq` changes, preventing unnecessary seeks or playback interruptions during normal rendering.
+The server first calculates the current position, stores it, updates the requested state, and increments the sequence number.
+
+This means the authoritative position is always derived from:
+
+```
+(positionAtLastUpdate, serverTimestampAtLastUpdate, isPlaying)
+```
+
+No server-side timer runs, so timing drift does not accumulate.
+
+Displays only apply playback changes when the server `seq` value changes, preventing unnecessary seeks during normal rendering.
 
 ---
 
-# Drift Detection and Synchronisation
+# Drift Detection and Correction
 
-Every **500 ms**, each Display:
+Every 500ms, each Display sends:
 
-1. Reads its local `<video>.currentTime`
-2. Projects the expected playback position from the latest authoritative state
-3. Sends its current playback status to the server
-
-```text
+```json
 {
-  position,
-  isPlaying,
-  isLoading
+  "position": 12.54,
+  "isPlaying": true,
+  "isLoading": false
 }
 ```
 
-The server calculates
+The server compares:
 
 ```
-drift = reportedPosition - expectedPosition
+display position - expected server position
 ```
 
-and stores the latest drift for display in the Controller dashboard.
+and records the drift for the Controller dashboard.
 
-Because expected playback is projected from the authoritative timestamp rather than copied from the latest broadcast, normal network latency only affects when updates arrive—not how the expected playback position is calculated.
+Because expected playback is projected from the authoritative timestamp, network latency affects update timing but not the calculated playback position.
 
 ---
 
-# Drift Correction Strategy
+# Correction Strategy
 
-The server uses a simple **threshold + cooldown** strategy.
+The synchronization system uses a simple **threshold + cooldown** strategy.
 
-### Threshold: 400 ms
+## Drift Threshold
 
-Small playback differences naturally occur because of decoding latency, event-loop scheduling, and browser timing precision.
+```
+400ms
+```
 
-Drift below roughly 400 ms is generally not visually noticeable across displays, so no correction is applied.
+Small timing differences naturally occur due to:
 
-### Cooldown: 3 seconds
+- Browser scheduling
+- Video decoding
+- Event-loop timing
+- Seek precision
 
-After correcting a display, the server waits at least 3 seconds before issuing another correction to the same client.
+Drift below this threshold is ignored.
 
-Without this cooldown, a buffering display could be repeatedly hard-seeked every status update, resulting in worse playback rather than improved synchronization.
+## Correction Cooldown
 
-### Correction Method
+```
+3000ms
+```
 
-The implementation performs a hard seek whenever drift exceeds the configured threshold.
+After correcting a Display, the server waits 3 seconds before allowing another correction for that Display.
 
-A playback-rate adjustment strategy (temporarily nudging playback to approximately 1.02×–1.05× until synchronized) would provide smoother corrections, but a threshold-based hard seek was chosen because it is deterministic, easy to reason about, and straightforward to verify within the assignment scope.
+This prevents repeated hard seeks when a client is buffering or temporarily unstable.
+
+## Correction Method
+
+When drift exceeds the threshold:
+
+- The server sends a correction command.
+- The Display seeks to the authoritative playback position.
+
+A smoother future improvement would be playback-rate correction (for example temporarily adjusting to 1.02x or 0.98x), but hard seeking was chosen because it is simple, deterministic, and easy to verify.
+
+---
+
+# Bonus: Rule-Based Health Analysis
+
+The Controller includes a **Generate Analysis** button that creates a health summary for each connected Display.
+
+The report includes:
+
+- Status
+- Average drift
+- Correction count
+- Disconnect count
+- Plain-English recommendation
+
+Although exposed as an analysis feature, this is intentionally a **rule-based engine**, not an LLM call.
+
+The payload and UI identify it as:
+
+```json
+{
+  "engine": "rule-based"
+}
+```
+
+The recommendation is generated from the same telemetry already visible in the Controller:
+
+- Drift values
+- Correction frequency
+- Disconnect history
+
+This approach provides:
+
+- Fully traceable recommendations
+- Deterministic results
+- No API dependency
+- Offline functionality
+
+The structured output from `generateHealthReport()` is also suitable input for a future LLM summarization layer if needed.
 
 ---
 
 # Running Locally
 
+## Start Server
+
 ```bash
-# Terminal 1
 cd server
 npm install
 npm start
 ```
 
-Runs the Socket.IO server at:
+Server runs at:
 
 ```
 http://localhost:4000
 ```
 
+---
+
+## Start Client
+
 ```bash
-# Terminal 2
 cd client
 npm install
 npm run dev
 ```
 
-Runs the React application at:
+Client runs at:
 
 ```
 http://localhost:5173
 ```
 
-Open:
+---
+
+# Using the Application
+
+Open the Controller:
 
 ```
 http://localhost:5173/controller
 ```
 
-and one or more displays:
+Open Displays in separate browser tabs:
 
 ```
 http://localhost:5173/display/A
 http://localhost:5173/display/B
 ```
 
-Displays autoplay muted because browsers block unmuted autoplay without a user gesture.
-
-To point the client at another server, configure:
+Any unique ID can be used:
 
 ```
-VITE_SERVER_URL
+/display/roomTV1
+/display/screen-2
+/display/lobby
 ```
 
-(see `client/.env.example`).
+Each ID becomes a separate Display entry in the Controller.
 
 ---
 
-# Features
+# Testing Synchronization
 
-### Controller
+After opening displays:
 
-- Select video
-- Play / Pause
-- Seek
-- Restart
-- Live display table
-- Per-display drift monitoring
-- Generate rule-based health report
+1. The Controller should show connected Displays.
+2. Select a video:
+   - Big Buck Bunny
+   - Elephants Dream
+3. Click **Play**.
+4. Verify all Displays start together.
+5. Test:
+   - Pause
+   - Seek
+   - Restart
 
-### Display
+The Controller table shows:
 
-- Unique display ID
-- Responds to all Controller commands
-- Periodic playback status updates
-- Live debug overlay
-- Automatic drift correction
+- Connection status
+- Playback position
+- Playing state
+- Drift
 
-### Server
+Drift should normally remain small.
+
+---
+
+# Testing Drift Correction
+
+To see correction behavior:
+
+1. Start playback.
+2. Move one Display tab into the background.
+3. Leave it for around 5 seconds.
+4. Return to the tab.
+
+Background browser throttling will cause the Display to fall behind.
+
+The Controller should show:
+
+1. Drift increasing.
+2. Correction being triggered.
+3. Display returning to the correct position.
+
+---
+
+# Generate Health Report
+
+Click:
+
+```
+Generate Analysis
+```
+
+The Controller will generate a rule-based health summary for all connected Displays.
+
+---
+
+# Features Implemented
+
+## Controller
+
+- Video selection
+- Play / Pause controls
+- Seek control
+- Restart control
+- Connected Display table
+- Live drift monitoring
+- Rule-based health analysis
+
+## Display
+
+- Unique Display ID
+- Receives playback commands
+- Sends playback telemetry
+- Debug information overlay
+- Automatic synchronization correction
+
+## Server
 
 - Authoritative playback state
 - Derived playback position
-- Sequence-based synchronization
-- Drift detection
-- Threshold + cooldown correction
+- Socket.IO communication
+- Drift calculation
+- Correction handling
 - Disconnect cleanup
-- Rule-based display health analysis
+- Health report generation
 
 ---
 
 # Verification
 
-The repository includes a `server/smoke-test.js` script that exercises the complete synchronization flow against a running Socket.IO server.
+The project includes:
 
-The smoke test validates:
+```
+server/smoke-test.js
+```
+
+The smoke test runs against a live Socket.IO server and verifies:
 
 - Play
 - Pause
@@ -218,32 +349,75 @@ The smoke test validates:
 - Position freezing while paused
 - Disconnect handling
 
-This verifies the synchronization logic against a live server rather than relying solely on manual testing.
+---
+
+# Environment Configuration
+
+For deployment, configure the client environment variable:
+
+`client/.env`
+
+```env
+VITE_SERVER_URL=http://localhost:4000
+```
+
+For production, replace the value with the deployed server URL:
+
+```env
+VITE_SERVER_URL=https://your-server-domain.com
+```
+
+Commit only:
+
+```
+client/.env.example
+```
+
+Do not commit:
+
+```
+client/.env
+```
 
 ---
 
 # Future Improvements
 
-Given the project timebox (~6–8 hours), the focus was on correctness of the synchronization loop rather than additional production features.
+Given the project time constraint, priority was placed on synchronization correctness and verification.
 
-Potential next steps include:
+Possible improvements:
 
-- Playwright end-to-end tests covering one Controller and multiple Display clients
-- Playback-rate based synchronization for smoother drift correction
-- Multiple synchronization sessions using Socket.IO rooms
-- Authentication and Controller authorization
-- Persistent display history across reconnects
-- Configurable video catalogue instead of hardcoded sample videos
+- Playwright end-to-end browser tests
+- Playback-rate based drift correction
+- Multiple sessions using Socket.IO rooms
+- Authentication and authorization
+- Persistent display history
+- Dynamic video catalogue
+- Production monitoring metrics
 
 ---
 
 # Deployment
 
-Deployment was optional for the assignment and is therefore not included.
+Deployment was optional for this assignment.
 
-A production deployment would typically consist of:
+A production deployment would typically use:
 
-- **Server:** Render, Railway, Fly.io, or another Node.js host
-- **Client:** Vercel or Netlify
-- Configure `VITE_SERVER_URL` to point to the deployed server
-- Restrict the server's CORS policy to the deployed client origin instead of allowing all origins
+### Client
+
+- Vercel
+- Netlify
+
+### Server
+
+- Render
+- Railway
+- Fly.io
+
+The deployed client should point to the server using:
+
+```
+VITE_SERVER_URL
+```
+
+For production, restrict Socket.IO CORS settings to the deployed client domain instead of allowing all origins.
